@@ -5,6 +5,11 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from lib.memory.retriever import VideoRAG
 
 import torch
 from PIL import Image
@@ -283,23 +288,57 @@ def query_recent_window(
     recent_frames_only: int,
     video_start: float | None = None,
     video_end: float | None = None,
+    retrieval_mode: Literal["recent", "rag"] = "recent",
+    rag: VideoRAG | None = None,
+    video_id: str | None = None,
 ) -> tuple[RecentWindowResult, str]:
-    chunks, decode_backend = decode_video_to_chunks_qwen(
-        video_path=video_path,
-        chunk_duration=chunk_duration,
-        fps=fps,
-        recent_frames_only=recent_frames_only,
-        video_start=video_start,
-        video_end=video_end,
-    )
-    if not chunks:
-        raise ValueError(f"No chunks decoded from video: {video_path}")
+    if retrieval_mode == "rag":
+        if rag is None:
+            raise ValueError("retrieval_mode='rag' requires a VideoRAG instance via `rag=`")
 
-    window_size = max(1, int(recent_frames_only))
-    recent_chunks = chunks[-window_size:]
+        # Decode all chunks so we can pick both recent and retrieved ones
+        chunks, decode_backend = decode_video_to_chunks_qwen(
+            video_path=video_path,
+            chunk_duration=chunk_duration,
+            fps=fps,
+            recent_frames_only=None,
+            video_start=video_start,
+            video_end=video_end,
+        )
+        if not chunks:
+            raise ValueError(f"No chunks decoded from video: {video_path}")
+
+        window_size = max(1, int(recent_frames_only))
+        recent_indices = {c.chunk_index for c in chunks[-window_size:]}
+
+        _video_id = video_id or Path(video_path).stem
+        query_time = chunks[-1].end_time
+        rag_results = rag.query_by_text(
+            prompt, video_id=_video_id, query_time=query_time, top_k=recent_frames_only
+        )
+        retrieved_indices = {r.chunk_index for r in rag_results}
+
+        chunk_map = {c.chunk_index: c for c in chunks}
+        merged_indices = recent_indices | retrieved_indices
+        selected_chunks = [chunk_map[i] for i in sorted(merged_indices) if i in chunk_map]
+    else:
+        chunks, decode_backend = decode_video_to_chunks_qwen(
+            video_path=video_path,
+            chunk_duration=chunk_duration,
+            fps=fps,
+            recent_frames_only=recent_frames_only,
+            video_start=video_start,
+            video_end=video_end,
+        )
+        if not chunks:
+            raise ValueError(f"No chunks decoded from video: {video_path}")
+
+        window_size = max(1, int(recent_frames_only))
+        selected_chunks = chunks[-window_size:]
+
     encoded_chunks: list[EncodedChunk] = []
-    encoded_outputs = qa.encode_vision_batched([chunk.frames for chunk in recent_chunks], max_frames_per_batch=8)
-    for chunk, (vision_emb, grid_thw) in zip(recent_chunks, encoded_outputs):
+    encoded_outputs = qa.encode_vision_batched([chunk.frames for chunk in selected_chunks], max_frames_per_batch=8)
+    for chunk, (vision_emb, grid_thw) in zip(selected_chunks, encoded_outputs):
         if int(vision_emb.shape[0]) == 0 or int(grid_thw.shape[0]) == 0:
             continue
         encoded_chunks.append(
@@ -314,7 +353,7 @@ def query_recent_window(
     if not encoded_chunks:
         raise ValueError(f"No vision chunks encoded from video: {video_path}")
 
-    encoded_window: deque[EncodedChunk] = deque(encoded_chunks, maxlen=window_size)
+    encoded_window: deque[EncodedChunk] = deque(encoded_chunks, maxlen=len(selected_chunks))
     t0 = time.perf_counter()
     combined_embeds, combined_grid_thw = _combine_window_embeddings(encoded_window, qa.model.device)
     answer = qa.generate_with_vision_features(combined_embeds, combined_grid_thw, prompt)
